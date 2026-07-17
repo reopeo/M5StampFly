@@ -40,8 +40,6 @@ void imu_init(void) {
 
     pinMode(46, OUTPUT);  // CSを設定
     digitalWrite(46, 1);  // CSをHIGH
-    pinMode(12, OUTPUT);  // CSを設定
-    digitalWrite(12, 1);  // CSをHIGH
     delay(5);
     USBSerial.printf("SPI Initilize status:%d\n\r", spi_init());
 
