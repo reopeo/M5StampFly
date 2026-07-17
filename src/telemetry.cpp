@@ -163,7 +163,7 @@ void make_telemetry_data(uint8_t* senddata) {
     data_set(senddata, Az_bias, &index);            // 27 Az_bias
     data_set_uint8(senddata, Alt_flag, &index);     // 28.1 Alt_flag(1 byte)
     data_set_uint8(senddata, Mode, &index);         // 28.2 fly mode(1 byte)
-    data_set_uint16(senddata, RangeFront, &index);  // 28.3-4 tof front
+    data_set_uint16(senddata, 0, &index);           // 28.3-4 reserved (formerly front ToF)
 }
 
 void telemetry_fast(void) {
