@@ -45,6 +45,7 @@ class PID {
     void printGain(void);
     void set_error(float err);
     float update(float err, float h);
+    float update_limited(float err, float h, float lower_limit, float upper_limit);
 };
 
 class Filter {
