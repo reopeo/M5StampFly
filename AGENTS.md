@@ -25,3 +25,21 @@ There is currently no dedicated unit-test directory or coverage requirement. Eve
 ## Commit & Pull Request Guidelines
 
 Recent history favors short, imperative subjects, sometimes scoped (for example, `[lib][vl53l3c] fix include path`). Keep each commit focused and state the affected area when useful. Pull requests should explain the change and motivation, list build and hardware validation, link related issues, and include logs, screenshots, or video when behavior is visible. Do not commit `.pio/` or other generated build artifacts; add firmware binaries only for an intentional release.
+
+## Integrated Drone VIO Role
+
+This repository is the flight-controller component of the parent Drone VIO
+workspace. Own flight safety, sensors, AHRS, attitude/altitude control, motor
+mixing, RC reception, and telemetry. Do not edit the camera or ROS components
+from this repository.
+
+Read the parent `../specs/` documents before changing an external interface.
+Packet layouts, units, coordinate frames, timing, arming, failsafe behavior,
+control rates, and PC-to-flight authority are cross-component contracts. Do not
+implement an unresolved `TBD` or make a breaking contract change locally; return
+a proposal to the primary coordinator first.
+
+Treat changes to motor output, arming, failsafe, and control timing as
+safety-critical. Firmware build results are not hardware evidence. Flashing and
+motor/flight tests require explicit authorization, and motor bench tests must
+begin with propellers removed.
