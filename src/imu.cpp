@@ -40,8 +40,6 @@ void imu_init(void) {
 
     pinMode(46, OUTPUT);  // CSを設定
     digitalWrite(46, 1);  // CSをHIGH
-    pinMode(12, OUTPUT);  // CSを設定
-    digitalWrite(12, 1);  // CSをHIGH
     delay(5);
     USBSerial.printf("SPI Initilize status:%d\n\r", spi_init());
 
@@ -64,8 +62,8 @@ void imu_init(void) {
     USBSerial.printf("#Sensor enable Status:%d\n\r", bmi2_sensor_enable(sensor_list, 2, pBmi270));
 }
 
-void imu_update(void) {
-    bmi2_get_sensor_data(&imu_data, pBmi270);
+bool imu_update(void) {
+    return bmi2_get_sensor_data(&imu_data, pBmi270) == 0;
 }
 
 float imu_get_acc_x(void) {

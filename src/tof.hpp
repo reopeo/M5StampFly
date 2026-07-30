@@ -32,14 +32,11 @@
 
 #define INT_BOTTOM   6
 #define XSHUT_BOTTOM 7
-#define INT_FRONT    8
-#define XSHUT_FRONT  9
 #define USER_A       0
 
 void tof_init(void);
 int16_t tof_range_get(VL53LX_DEV dev);
 void tof_test_ranging(VL53LX_DEV dev);
 int16_t tof_bottom_get_range();
-int16_t tof_front_get_range();
 
 #endif

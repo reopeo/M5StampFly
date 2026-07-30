@@ -39,6 +39,8 @@ build/
 .vscode/ipch
 .vscode
 .DS_Store
+secrets.ini
+include/secrets.hpp
 src/.DS_Store
 lib/.DS_Store
 include/.DS_Store

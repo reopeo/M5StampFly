@@ -79,6 +79,28 @@ float PID::update(float err, float h) {
     return m_kp * (err + m_integral + m_differential);
 }
 
+float PID::update_limited(float err, float h, float lower_limit, float upper_limit) {
+    const float old_integral = m_integral;
+    float output             = update(err, h);
+
+    // Stop integrating only when the new integral contribution would drive an
+    // already limited output farther into saturation. Allow integration in the
+    // recovery direction so accumulated error can unwind.
+    if ((output > upper_limit && m_integral > old_integral) ||
+        (output < lower_limit && m_integral < old_integral)) {
+        m_integral = old_integral;
+        output     = m_kp * (err + m_integral + m_differential);
+    }
+
+    if (output > upper_limit) {
+        output = upper_limit;
+    }
+    if (output < lower_limit) {
+        output = lower_limit;
+    }
+    return output;
+}
+
 Filter::Filter() {
     m_state = 0.0f;
     m_T     = 0.0025f;

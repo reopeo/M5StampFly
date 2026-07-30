@@ -54,16 +54,13 @@ volatile float Accel_x_raw, Accel_y_raw, Accel_z_raw;
 volatile float Accel_x, Accel_y, Accel_z;
 volatile float Roll_rate_raw, Pitch_rate_raw, Yaw_rate_raw;
 volatile float Mx, My, Mz, Mx0, My0, Mz0, Mx_ave, My_ave, Mz_ave;
-volatile int16_t RawRange      = 0;
-volatile int16_t Range         = 0;
-volatile int16_t RawRangeFront = 0;
-volatile int16_t RangeFront    = 0;
+volatile int16_t RawRange   = 0;
+volatile int16_t Range      = 0;
 volatile float Altitude        = 0.0f;
 volatile float Altitude2       = 0.0f;
 volatile float Alt_velocity    = 0.0f;
 volatile float Az              = 0.0;
 volatile float Az_bias         = 0.0;
-int16_t deltaX, deltaY;
 
 volatile uint16_t Offset_counter = 0;
 
@@ -74,6 +71,7 @@ float Over_g = 0.0f, Over_rate = 0.0f;
 uint8_t OverG_flag                  = 0;
 uint8_t Range0flag                  = 0;
 volatile uint8_t Under_voltage_flag = 0;
+volatile uint8_t Imu_read_valid     = 0;
 // volatile uint8_t ToF_bottom_data_ready_flag;
 // volatile uint16_t Range=1000;
 
@@ -188,13 +186,11 @@ float sensor_read(void) {
     uint32_t st;
     float sens_interval;
     float h;
-    static float opt_interval = 0.0;
 
     st              = micros();
     old_sensor_time = sensor_time;
     sensor_time     = (float)st * 1.0e-6;
     sens_interval   = sensor_time - old_sensor_time;
-    opt_interval    = opt_interval + sens_interval;
 
     // 以下では航空工学の座標軸の取り方に従って
     // X軸：前後（前が正）左肩上がりが回転の正
@@ -207,7 +203,7 @@ float sensor_read(void) {
     // Z軸：上下（上が正）左回りが回転の正
 
     // Get IMU raw data
-    imu_update();  // IMUの値を読む前に必ず実行
+    Imu_read_valid = imu_update() ? 1 : 0;  // IMUの値を読む前に必ず実行
     acc_x  = imu_get_acc_x();
     acc_y  = imu_get_acc_y();
     acc_z  = imu_get_acc_z();
@@ -282,13 +278,9 @@ float sensor_read(void) {
                 // 距離の値の更新
                 // old_range[0] = dist;
                 RawRange = tof_bottom_get_range();
-                if (Mode == PARKING_MODE) RawRangeFront = tof_front_get_range();
                 // USBSerial.printf("%9.6f %d\n\r", Elapsed_time, RawRange);
                 if (RawRange > 20) {
                     Range = RawRange;
-                }
-                if (RawRangeFront > 0.01) {
-                    RangeFront = RawRangeFront;
                 }
 
                 // 外れ値処理

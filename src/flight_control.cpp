@@ -231,6 +231,7 @@ uint8_t auto_landing(void);
 float get_trim_duty(float voltage);
 void flip(void);
 float get_rate_ref(float x);
+void observation_safety_enforce(void);
 
 // 割り込み関数
 // Intrupt function
@@ -266,8 +267,8 @@ void init_copter(void) {
     // PID GAIN and etc. Init
     control_init();
 
-    // Initilize Radio control
-    rc_init();
+    // Observation telemetry is isolated in its own task before the 400 Hz timer starts.
+    telemetry_init();
 
     // 割り込み設定
     // Initialize intrupt
@@ -306,6 +307,32 @@ void loop_400Hz(void) {
 
     // LED Drive
     led_drive();
+    if (Mode == INIT_MODE) {
+        motor_stop();
+        Elevator_center = 0.0f;
+        Aileron_center = 0.0f;
+        Rudder_center = 0.0f;
+        Roll_angle_offset = 0.0f;
+        Pitch_angle_offset = 0.0f;
+        Yaw_angle_offset = 0.0f;
+        sensor_reset_offset();
+        Mode = AVERAGE_MODE;
+        return;
+    }
+    if (Mode == AVERAGE_MODE) {
+        motor_stop();
+        if (OffsetCounter < AVERAGENUM) {
+            sensor_calc_offset_avarage();
+            OffsetCounter++;
+            return;
+        }
+        S_time = micros();
+    }
+    observation_safety_enforce();
+    telemetry_capture_imu();
+    OldMode = Mode;
+    return;
+
     // if (Interval_time>0.006)USBSerial.printf("%9.6f\n\r", Interval_time);
     // USBSerial.printf("Mode=%d OverG=%d\n\r", Mode, OverG_flag);
     // Begin Mode select
@@ -401,14 +428,45 @@ void loop_400Hz(void) {
         rate_control();
     }
 
-    //// Telemetry
-    // telemetry_fast();
-    telemetry();
-
     uint32_t ce_time = micros();
     Dt_time          = ce_time - cs_time;
     OldMode          = Mode;  // Memory now mode
     // End of Loop_400Hz function
+}
+
+void observation_safety_enforce(void) {
+    Mode = PARKING_MODE;
+    Control_mode = ANGLECONTROL;
+    Throttle_control_mode = 0;
+    Alt_flag = 0;
+    Flip_flag = 0;
+    Thrust_command = 0.0f;
+    Thrust_command2 = 0.0f;
+    Thrust0 = 0.0f;
+    Roll_rate_reference = 0.0f;
+    Pitch_rate_reference = 0.0f;
+    Yaw_rate_reference = 0.0f;
+    Roll_angle_reference = 0.0f;
+    Pitch_angle_reference = 0.0f;
+    Yaw_angle_reference = 0.0f;
+    Roll_rate_command = 0.0f;
+    Pitch_rate_command = 0.0f;
+    Yaw_rate_command = 0.0f;
+    Roll_angle_command = 0.0f;
+    Pitch_angle_command = 0.0f;
+    Yaw_angle_command = 0.0f;
+    FrontRight_motor_duty = 0.0f;
+    FrontLeft_motor_duty = 0.0f;
+    RearRight_motor_duty = 0.0f;
+    RearLeft_motor_duty = 0.0f;
+    p_pid.reset();
+    q_pid.reset();
+    r_pid.reset();
+    phi_pid.reset();
+    theta_pid.reset();
+    alt_pid.reset();
+    z_dot_pid.reset();
+    motor_stop();
 }
 
 void flip(void) {
@@ -860,10 +918,9 @@ void rate_control(void) {
         q_err = q_ref - q_rate;
         r_err = r_ref - r_rate;
 
-        // Rate Control PID
+        // Roll/pitch rate control has priority over yaw in the motor mixer.
         Roll_rate_command  = p_pid.update(p_err, Interval_time);
         Pitch_rate_command = q_pid.update(q_err, Interval_time);
-        Yaw_rate_command   = r_pid.update(r_err, Interval_time);
 
         // Altutude Control
         if (Alt_flag == 1 && Flip_flag == 0) {
@@ -880,23 +937,76 @@ void rate_control(void) {
             // if (Thrust_command/BATTERY_VOLTAGE < Thrust0*0.9f ) Thrust_command = BATTERY_VOLTAGE*Thrust0*0.9f;
         }
 
-        // Motor Control
-        // 正規化Duty
-        FrontRight_motor_duty = Duty_fr.update(
-            (Thrust_command + (-Roll_rate_command + Pitch_rate_command + Yaw_rate_command) * 0.25f) / BATTERY_VOLTAGE,
-            Interval_time);
-        FrontLeft_motor_duty = Duty_fl.update(
-            (Thrust_command + (Roll_rate_command + Pitch_rate_command - Yaw_rate_command) * 0.25f) / BATTERY_VOLTAGE,
-            Interval_time);
-        RearRight_motor_duty = Duty_rr.update(
-            (Thrust_command + (-Roll_rate_command - Pitch_rate_command - Yaw_rate_command) * 0.25f) / BATTERY_VOLTAGE,
-            Interval_time);
-        RearLeft_motor_duty = Duty_rl.update(
-            (Thrust_command + (Roll_rate_command - Pitch_rate_command + Yaw_rate_command) * 0.25f) / BATTERY_VOLTAGE,
-            Interval_time);
-
         const float minimum_duty = 0.0f;
-        const float maximum_duty = 0.95f;
+        const float maximum_duty = 0.99f;
+
+        // Normalize the roll/pitch correction. If its total span exceeds the
+        // motor range, scale both axes together and preserve the correction
+        // direction. Yaw is mixed later at lower priority.
+        float collective = Thrust_command / BATTERY_VOLTAGE;
+        const float roll_mix  = Roll_rate_command * 0.25f / BATTERY_VOLTAGE;
+        const float pitch_mix = Pitch_rate_command * 0.25f / BATTERY_VOLTAGE;
+        float rp_mix[4]       = {-roll_mix + pitch_mix, roll_mix + pitch_mix, -roll_mix - pitch_mix,
+                                 roll_mix - pitch_mix};
+
+        float rp_min      = rp_mix[0];
+        float rp_max      = rp_mix[0];
+        for (uint8_t i = 1; i < 4; i++) {
+            if (rp_mix[i] < rp_min) rp_min = rp_mix[i];
+            if (rp_mix[i] > rp_max) rp_max = rp_mix[i];
+        }
+
+        const float rp_span = rp_max - rp_min;
+        if (rp_span > maximum_duty) {
+            const float scale = maximum_duty / rp_span;
+            for (uint8_t i = 0; i < 4; i++) rp_mix[i] *= scale;
+            rp_min = rp_mix[0];
+            rp_max = rp_mix[0];
+            for (uint8_t i = 1; i < 4; i++) {
+                if (rp_mix[i] < rp_min) rp_min = rp_mix[i];
+                if (rp_mix[i] > rp_max) rp_max = rp_mix[i];
+            }
+        }
+
+        // Shift collective only as far as required to preserve roll/pitch
+        // authority instead of clipping each motor independently.
+        const float collective_min = minimum_duty - rp_min;
+        const float collective_max = maximum_duty - rp_max;
+        if (collective < collective_min) collective = collective_min;
+        if (collective > collective_max) collective = collective_max;
+
+        // Find the asymmetric yaw range that keeps every motor within bounds.
+        // Positive yaw adds to FR/RL and subtracts from FL/RR.
+        const int8_t yaw_sign[4] = {1, -1, -1, 1};
+        float yaw_mix_min        = -maximum_duty;
+        float yaw_mix_max        = maximum_duty;
+        for (uint8_t i = 0; i < 4; i++) {
+            const float motor_without_yaw = collective + rp_mix[i];
+            float motor_yaw_min;
+            float motor_yaw_max;
+            if (yaw_sign[i] > 0) {
+                motor_yaw_min = minimum_duty - motor_without_yaw;
+                motor_yaw_max = maximum_duty - motor_without_yaw;
+            } else {
+                motor_yaw_min = motor_without_yaw - maximum_duty;
+                motor_yaw_max = motor_without_yaw - minimum_duty;
+            }
+            if (motor_yaw_min > yaw_mix_min) yaw_mix_min = motor_yaw_min;
+            if (motor_yaw_max < yaw_mix_max) yaw_mix_max = motor_yaw_max;
+        }
+
+        const float yaw_command_min = yaw_mix_min * 4.0f * BATTERY_VOLTAGE;
+        const float yaw_command_max = yaw_mix_max * 4.0f * BATTERY_VOLTAGE;
+        Yaw_rate_command = r_pid.update_limited(r_err, Interval_time, yaw_command_min, yaw_command_max);
+
+        const float yaw_mix = Yaw_rate_command * 0.25f / BATTERY_VOLTAGE;
+        const float motor_target[4] = {collective + rp_mix[0] + yaw_mix, collective + rp_mix[1] - yaw_mix,
+                                       collective + rp_mix[2] - yaw_mix, collective + rp_mix[3] + yaw_mix};
+
+        FrontRight_motor_duty = Duty_fr.update(motor_target[0], Interval_time);
+        FrontLeft_motor_duty  = Duty_fl.update(motor_target[1], Interval_time);
+        RearRight_motor_duty  = Duty_rr.update(motor_target[2], Interval_time);
+        RearLeft_motor_duty   = Duty_rl.update(motor_target[3], Interval_time);
 
         if (FrontRight_motor_duty < minimum_duty) FrontRight_motor_duty = minimum_duty;
         if (FrontRight_motor_duty > maximum_duty) FrontRight_motor_duty = maximum_duty;

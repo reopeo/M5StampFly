@@ -1,264 +1,215 @@
-/*
- * MIT License
- *
- * Copyright (c) 2024 Kouhei Ito
- * Copyright (c) 2024 M5Stack
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
 #include "telemetry.hpp"
 
-#include "rc.hpp"
-#include "led.hpp"
-#include "sensor.hpp"
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <esp_mac.h>
+#include <esp_system.h>
+#include <esp_timer.h>
+#include <math.h>
+
 #include "flight_control.hpp"
+#include "protocol.hpp"
+#include "sensor.hpp"
 
-uint8_t Telem_mode     = 0;
-uint8_t Telem_cnt      = 0;
-const uint8_t MAXINDEX = 120;
-const uint8_t MININDEX = 30;
+#ifndef DRONE_WIFI_SSID
+#define DRONE_WIFI_SSID ""
+#endif
+#ifndef DRONE_WIFI_PASSWORD
+#define DRONE_WIFI_PASSWORD ""
+#endif
+#ifndef DRONE_PC_IP
+#define DRONE_PC_IP ""
+#endif
+#ifndef DRONE_UDP_PORT
+#define DRONE_UDP_PORT 5600
+#endif
 
-void telemetry_sequence(void);
-void telemetry_sequence_fast(void);
-void make_telemetry_header_data(uint8_t* senddata);
-void make_telemetry_data(uint8_t* senddata);
-void make_telemetry_data_fast(uint8_t* senddata);
-void data2log(uint8_t* data_list, float add_data, uint8_t index);
-void float2byte(float x, uint8_t* dst);
-void append_data(uint8_t* data, uint8_t* newdata, uint8_t index, uint8_t len);
-void data_set(uint8_t* datalist, float value, uint8_t* index);
-void data_set_uint32(uint8_t* datalist, uint32_t value, uint8_t* index);
-void data_set_uint16(uint8_t* datalist, uint16_t value, uint8_t* index);
-void data_set_uint8(uint8_t* datalist, uint8_t value, uint8_t* index);
+namespace {
+constexpr uint8_t IMU_QUEUE_CAPACITY = 8;
+constexpr float GRAVITY_MPS2 = 9.80665f;
+constexpr uint32_t WIFI_BACKOFF_MAX_MS = 30000;
 
-void telemetry(void) {
-    uint8_t senddata[MAXINDEX];
+struct queued_imu_sample_t {
+    protocol_imu_sample_t sample;
+    uint64_t acquisition_time_us;
+};
 
-    if (Telem_mode == 0) {
-        // Send header data
-        Telem_mode = 1;
-        make_telemetry_header_data(senddata);
+queued_imu_sample_t imu_queue[IMU_QUEUE_CAPACITY];
+portMUX_TYPE imu_queue_mux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t imu_queue_head = 0;
+volatile uint8_t imu_queue_count = 0;
+volatile bool imu_queue_overflow = false;
+volatile uint32_t imu_queue_drop_count = 0;
+volatile uint32_t udp_send_failure_count = 0;
+volatile uint32_t wifi_reconnect_count = 0;
+volatile uint8_t wifi_state = 0;
 
-        // Send !
-        telemetry_send(senddata, sizeof(senddata));
-    } else if (Mode > AVERAGE_MODE) {
-        const uint8_t N = 10;
-        // N回に一度送信
-        if (Telem_cnt == 0) telemetry_sequence();
-        Telem_cnt++;
-        if (Telem_cnt > N - 1) Telem_cnt = 0;
-        // telemetry_sequence();
+uint64_t source_id = 0;
+uint32_t session_id = 1;
+uint32_t next_sequence = 0;
+uint32_t last_imu_sequence = 0;
+IPAddress pc_address;
+bool pc_address_valid = false;
+
+uint32_t backoff_ms = 1000;
+uint32_t next_connect_attempt_ms = 0;
+bool wifi_connected_once = false;
+
+bool parse_pc_address(void) {
+    return pc_address.fromString(DRONE_PC_IP);
+}
+
+void queue_imu_sample(const queued_imu_sample_t& sample) {
+    portENTER_CRITICAL(&imu_queue_mux);
+    if (imu_queue_count == IMU_QUEUE_CAPACITY) {
+        imu_queue_head = static_cast<uint8_t>((imu_queue_head + 1) % IMU_QUEUE_CAPACITY);
+        imu_queue_count--;
+        imu_queue_drop_count++;
+        imu_queue_overflow = true;
+    }
+    const uint8_t tail = static_cast<uint8_t>((imu_queue_head + imu_queue_count) % IMU_QUEUE_CAPACITY);
+    imu_queue[tail] = sample;
+    imu_queue_count++;
+    portEXIT_CRITICAL(&imu_queue_mux);
+}
+
+bool take_imu_sample(queued_imu_sample_t* sample, bool* overflow) {
+    bool available = false;
+    portENTER_CRITICAL(&imu_queue_mux);
+    if (imu_queue_count != 0) {
+        *sample = imu_queue[imu_queue_head];
+        imu_queue_head = static_cast<uint8_t>((imu_queue_head + 1) % IMU_QUEUE_CAPACITY);
+        imu_queue_count--;
+        *overflow = imu_queue_overflow;
+        imu_queue_overflow = false;
+        available = true;
+    }
+    portEXIT_CRITICAL(&imu_queue_mux);
+    return available;
+}
+
+uint32_t queue_drop_count_snapshot(void) {
+    portENTER_CRITICAL(&imu_queue_mux);
+    const uint32_t result = imu_queue_drop_count;
+    portEXIT_CRITICAL(&imu_queue_mux);
+    return result;
+}
+
+void start_wifi_connect(void) {
+    if (!pc_address_valid || DRONE_WIFI_SSID[0] == '\0') {
+        wifi_state = 0;
+        return;
+    }
+    wifi_state = 1;
+    WiFi.begin(DRONE_WIFI_SSID, DRONE_WIFI_PASSWORD);
+}
+
+void maintain_wifi(uint32_t now_ms) {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (wifi_state != 2) {
+            wifi_state = 2;
+            if (wifi_connected_once) wifi_reconnect_count++;
+            wifi_connected_once = true;
+        }
+        backoff_ms = 1000;
+        return;
+    }
+
+    if (wifi_state == 2) wifi_state = 0;
+    if (static_cast<int32_t>(now_ms - next_connect_attempt_ms) < 0) return;
+
+    start_wifi_connect();
+    next_connect_attempt_ms = now_ms + backoff_ms;
+    backoff_ms = min(backoff_ms * 2, WIFI_BACKOFF_MAX_MS);
+}
+
+bool send_datagram(WiFiUDP& udp, const uint8_t* data, size_t length) {
+    if (!pc_address_valid || udp.beginPacket(pc_address, DRONE_UDP_PORT) != 1) return false;
+    if (udp.write(data, length) != length) return false;
+    return udp.endPacket() == 1;
+}
+
+void send_status(WiFiUDP& udp) {
+    protocol_status_t status = {};
+    status.uptime_us = static_cast<uint64_t>(esp_timer_get_time());
+    status.last_imu_sequence = last_imu_sequence;
+    status.imu_queue_drop_count = queue_drop_count_snapshot();
+    status.udp_send_failure_count = udp_send_failure_count;
+    status.wifi_reconnect_count = wifi_reconnect_count;
+    status.wifi_state = wifi_state;
+    status.health_flags = 0;
+    status.rssi_dbm = static_cast<int8_t>(WiFi.RSSI());
+    status.wifi_channel = static_cast<uint8_t>(WiFi.channel());
+    status.last_error_code = 0;
+
+    uint8_t datagram[PROTOCOL_STATUS_DATAGRAM_SIZE];
+    const size_t length = protocol_encode_status(datagram, sizeof(datagram), source_id, session_id, next_sequence++,
+                                                 status.uptime_us, status);
+    if (!send_datagram(udp, datagram, length)) udp_send_failure_count++;
+}
+
+void telemetry_sender_task(void*) {
+    WiFiUDP udp;
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    pc_address_valid = parse_pc_address();
+    uint32_t next_status_ms = 0;
+    uint8_t previous_wifi_state = 0xff;
+
+    for (;;) {
+        const uint32_t now_ms = millis();
+        maintain_wifi(now_ms);
+        if (wifi_state == 2) {
+            if (wifi_state != previous_wifi_state || static_cast<int32_t>(now_ms - next_status_ms) >= 0) {
+                send_status(udp);
+                next_status_ms = now_ms + 1000;
+            }
+
+            queued_imu_sample_t queued;
+            bool overflow = false;
+            if (take_imu_sample(&queued, &overflow)) {
+                if (overflow) queued.sample.health_flags |= 0x04;
+                uint8_t datagram[PROTOCOL_IMU_DATAGRAM_SIZE];
+                const uint32_t sequence = next_sequence++;
+                const size_t length = protocol_encode_imu(datagram, sizeof(datagram), source_id, session_id, sequence,
+                                                          queued.acquisition_time_us, queued.sample);
+                last_imu_sequence = sequence;
+                if (!send_datagram(udp, datagram, length)) udp_send_failure_count++;
+            }
+        }
+        previous_wifi_state = wifi_state;
+        vTaskDelay(1);
     }
 }
+}  // namespace
 
-void telemetry_sequence(void) {
-    uint8_t senddata[MAXINDEX];
+void telemetry_init(void) {
+    uint8_t mac[6] = {};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    for (uint8_t byte : mac) source_id = (source_id << 8) | byte;
+    session_id = esp_random();
+    if (session_id == 0) session_id = 1;
+    xTaskCreatePinnedToCore(telemetry_sender_task, "telemetry_sender", 4096, nullptr, 1, nullptr, 0);
+}
 
-    switch (Telem_mode) {
-        case 1:
-            make_telemetry_data(senddata);
-            // Send !
-            if (telemetry_send(senddata, sizeof(senddata)) == 1)
-                esp_led(0x110000, 1);  // Telemetory Reciver OFF
-            else
-                esp_led(0x001100, 1);  // Telemetory Reciver ON
+void telemetry_capture_imu(void) {
+    if (wifi_state != 2) return;
 
-            // Telem_mode = 2;
-            break;
+    queued_imu_sample_t queued = {};
+    queued.acquisition_time_us = static_cast<uint64_t>(esp_timer_get_time());
+    queued.sample.accel_x = Accel_x_raw * GRAVITY_MPS2;
+    queued.sample.accel_y = -Accel_y_raw * GRAVITY_MPS2;
+    queued.sample.accel_z = -Accel_z_raw * GRAVITY_MPS2;
+    queued.sample.gyro_x = Roll_rate_raw;
+    queued.sample.gyro_y = -Pitch_rate_raw;
+    queued.sample.gyro_z = -Yaw_rate_raw;
+    queued.sample.sample_period_us = static_cast<uint32_t>(Interval_time * 1000000.0f);
+    queued.sample.health_flags = static_cast<uint8_t>(0x0a | (Imu_read_valid != 0 ? 0x01 : 0x00));
+
+    if (!isfinite(queued.sample.accel_x) || !isfinite(queued.sample.accel_y) || !isfinite(queued.sample.accel_z) ||
+        !isfinite(queued.sample.gyro_x) || !isfinite(queued.sample.gyro_y) || !isfinite(queued.sample.gyro_z)) {
+        queued.sample.health_flags &= static_cast<uint8_t>(~0x01U);
     }
-}
-
-void make_telemetry_header_data(uint8_t* senddata) {
-    float d_float;
-    uint8_t d_int[4];
-    uint8_t index = 0;
-
-    index = 2;
-    for (uint8_t i = 0; i < (MAXINDEX - 2) / 4; i++) {
-        data2log(senddata, 0.0f, index);
-        index = index + 4;
-    }
-    // Telemetry Header
-    senddata[0] = 99;
-    senddata[1] = 99;
-    index       = 2;
-    data_set(senddata, Roll_rate_kp, &index);
-    data_set(senddata, Roll_rate_ti, &index);
-    data_set(senddata, Roll_rate_td, &index);
-    data_set(senddata, Roll_rate_eta, &index);
-    data_set(senddata, Pitch_rate_kp, &index);
-    data_set(senddata, Pitch_rate_ti, &index);
-    data_set(senddata, Pitch_rate_td, &index);
-    data_set(senddata, Pitch_rate_eta, &index);
-    data_set(senddata, Yaw_rate_kp, &index);
-    data_set(senddata, Yaw_rate_ti, &index);
-    data_set(senddata, Yaw_rate_td, &index);
-    data_set(senddata, Yaw_rate_eta, &index);
-    data_set(senddata, Rall_angle_kp, &index);
-    data_set(senddata, Rall_angle_ti, &index);
-    data_set(senddata, Rall_angle_td, &index);
-    data_set(senddata, Rall_angle_eta, &index);
-    data_set(senddata, Pitch_angle_kp, &index);
-    data_set(senddata, Pitch_angle_ti, &index);
-    data_set(senddata, Pitch_angle_td, &index);
-    data_set(senddata, Pitch_angle_eta, &index);
-}
-
-void make_telemetry_data(uint8_t* senddata) {
-    float d_float;
-    uint8_t d_int[4];
-    uint8_t index = 0;
-
-    // Telemetry Header
-    senddata[0] = 88;
-    senddata[1] = 88;
-    index       = 2;
-    data_set(senddata, Elapsed_time, &index);                                   // 1 Time
-    data_set(senddata, Interval_time, &index);                                  // 2 delta Time
-    data_set(senddata, (Roll_angle - Roll_angle_offset) * 180 / PI, &index);    // 3 Roll_angle
-    data_set(senddata, (Pitch_angle - Pitch_angle_offset) * 180 / PI, &index);  // 4 Pitch_angle
-    data_set(senddata, (Yaw_angle - Yaw_angle_offset) * 180 / PI, &index);      // 5 Yaw_angle
-    data_set(senddata, (Roll_rate) * 180 / PI, &index);                         // 6 P
-    data_set(senddata, (Pitch_rate) * 180 / PI, &index);                        // 7 Q
-    data_set(senddata, (Yaw_rate) * 180 / PI, &index);                          // 8 R
-    data_set(senddata, Roll_angle_reference * 180 / PI, &index);                // 9 Roll_angle_reference
-    // data_set(senddata, 0.5f * 180.0f *Roll_angle_command, index);
-    data_set(senddata, Pitch_angle_reference * 180 / PI, &index);  // 10 Pitch_angle_reference
-    // data_set(senddata, 0.5 * 189.0f* Pitch_angle_command, index);
-    data_set(senddata, Roll_rate_reference * 180 / PI, &index);    // 11 P ref
-    data_set(senddata, Pitch_rate_reference * 180 / PI, &index);   // 12 Q ref
-    data_set(senddata, Yaw_rate_reference * 180 / PI, &index);     // 13 R ref
-    data_set(senddata, Thrust_command / BATTERY_VOLTAGE, &index);  // 14 T ref
-    data_set(senddata, Voltage, &index);                           // 15 Voltage
-    data_set(senddata, Accel_x_raw, &index);                       // 16 Accel_x_raw
-    data_set(senddata, Accel_y_raw, &index);                       // 17 Accel_y_raw
-    data_set(senddata, Accel_z_raw, &index);                       // 18 Accel_z_raw
-    data_set(senddata, Alt_velocity, &index);                      // 19 Alt Velocity
-    data_set(senddata, Z_dot_ref, &index);                         // 20 Z_dot_ref
-    // data_set(senddata, FrontRight_motor_duty, index);
-    data_set(senddata, FrontLeft_motor_duty, &index);  // 21 FrontLeft_motor_duty
-    data_set(senddata, RearRight_motor_duty, &index);  // 22 RearRight_motor_duty
-    // data_set(senddata, RearLeft_motor_duty, index);
-    data_set(senddata, Alt_ref, &index);            // 23 Alt_ref
-    data_set(senddata, Altitude2, &index);          // 24 Altitude2
-    data_set(senddata, Altitude, &index);           // 25 Sense_Alt
-    data_set(senddata, Az, &index);                 // 26 Az
-    data_set(senddata, Az_bias, &index);            // 27 Az_bias
-    data_set_uint8(senddata, Alt_flag, &index);     // 28.1 Alt_flag(1 byte)
-    data_set_uint8(senddata, Mode, &index);         // 28.2 fly mode(1 byte)
-    data_set_uint16(senddata, RangeFront, &index);  // 28.3-4 tof front
-}
-
-void telemetry_fast(void) {
-    uint8_t senddata[MAXINDEX];
-
-    if (Telem_mode == 0) {
-        // Send header data
-        Telem_mode = 1;
-        make_telemetry_header_data(senddata);
-
-        // Send !
-        telemetry_send(senddata, sizeof(senddata));
-    }
-    // else if(Mode > AVERAGE_MODE)
-    //{
-    //   telemetry_sequence400();
-    // }
-    else if (Mode > AVERAGE_MODE) {
-        const uint8_t N = 8;
-        // N回に一度送信
-        if (Telem_cnt == 0) telemetry_sequence_fast();
-        Telem_cnt++;
-        if (Telem_cnt > N - 1) Telem_cnt = 0;
-        // telemetry_sequence();
-    }
-}
-
-void telemetry_sequence_fast(void) {
-    uint8_t senddata[MAXINDEX];
-
-    make_telemetry_data_fast(senddata);
-    // Send !
-    if (telemetry_send(senddata, MININDEX) == 1)
-        esp_led(0x110000, 1);  // Telemetory Reciver OFF
-    else
-        esp_led(0x001100, 1);  // Telemetory Reciver ON
-}
-
-void make_telemetry_data_fast(uint8_t* senddata) {
-    float d_float;
-    uint8_t d_int[4];
-    uint8_t index = 0;
-
-    // Telemetry Header
-    senddata[0] = 88;
-    senddata[1] = 88;
-    index       = 2;
-
-    data_set(senddata, Elapsed_time, &index);  // 1 Time
-    data_set(senddata, Mode, &index);          // 3 Accel_z
-    data_set(senddata, Alt_flag, &index);      // 2 Accel_z_raw
-    data_set(senddata, RawRange / 1000.0, &index);
-    data_set(senddata, Altitude, &index);
-    data_set(senddata, Altitude2, &index);
-    data_set(senddata, Alt_ref, &index);
-}
-
-void data_set(uint8_t* datalist, float value, uint8_t* index) {
-    data2log(datalist, value, *index);
-    *index = *index + 4;
-}
-
-void data_set_uint32(uint8_t* datalist, uint32_t value, uint8_t* index) {
-    append_data(datalist, (uint8_t*)&value, *index, 4);
-    *index = *index + 4;
-}
-
-void data_set_uint16(uint8_t* datalist, uint16_t value, uint8_t* index) {
-    append_data(datalist, (uint8_t*)&value, *index, 2);
-    *index = *index + 2;
-}
-
-void data_set_uint8(uint8_t* datalist, uint8_t value, uint8_t* index) {
-    append_data(datalist, (uint8_t*)&value, *index, 1);
-    *index = *index + 1;
-}
-
-void data2log(uint8_t* data_list, float add_data, uint8_t index) {
-    uint8_t d_int[4];
-    float d_float = add_data;
-    float2byte(d_float, d_int);
-    append_data(data_list, d_int, index, 4);
-}
-
-void float2byte(float x, uint8_t* dst) {
-    uint8_t* dummy;
-    dummy  = (uint8_t*)&x;
-    dst[0] = dummy[0];
-    dst[1] = dummy[1];
-    dst[2] = dummy[2];
-    dst[3] = dummy[3];
-}
-
-void append_data(uint8_t* data, uint8_t* newdata, uint8_t index, uint8_t len) {
-    for (uint8_t i = index; i < index + len; i++) {
-        data[i] = newdata[i - index];
-    }
+    queue_imu_sample(queued);
 }
