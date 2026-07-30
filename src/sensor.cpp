@@ -71,6 +71,7 @@ float Over_g = 0.0f, Over_rate = 0.0f;
 uint8_t OverG_flag                  = 0;
 uint8_t Range0flag                  = 0;
 volatile uint8_t Under_voltage_flag = 0;
+volatile uint8_t Imu_read_valid     = 0;
 // volatile uint8_t ToF_bottom_data_ready_flag;
 // volatile uint16_t Range=1000;
 
@@ -202,7 +203,7 @@ float sensor_read(void) {
     // Z軸：上下（上が正）左回りが回転の正
 
     // Get IMU raw data
-    imu_update();  // IMUの値を読む前に必ず実行
+    Imu_read_valid = imu_update() ? 1 : 0;  // IMUの値を読む前に必ず実行
     acc_x  = imu_get_acc_x();
     acc_y  = imu_get_acc_y();
     acc_z  = imu_get_acc_z();

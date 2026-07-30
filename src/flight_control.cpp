@@ -231,6 +231,7 @@ uint8_t auto_landing(void);
 float get_trim_duty(float voltage);
 void flip(void);
 float get_rate_ref(float x);
+void observation_safety_enforce(void);
 
 // 割り込み関数
 // Intrupt function
@@ -266,8 +267,8 @@ void init_copter(void) {
     // PID GAIN and etc. Init
     control_init();
 
-    // Initilize Radio control
-    rc_init();
+    // Observation telemetry is isolated in its own task before the 400 Hz timer starts.
+    telemetry_init();
 
     // 割り込み設定
     // Initialize intrupt
@@ -306,6 +307,32 @@ void loop_400Hz(void) {
 
     // LED Drive
     led_drive();
+    if (Mode == INIT_MODE) {
+        motor_stop();
+        Elevator_center = 0.0f;
+        Aileron_center = 0.0f;
+        Rudder_center = 0.0f;
+        Roll_angle_offset = 0.0f;
+        Pitch_angle_offset = 0.0f;
+        Yaw_angle_offset = 0.0f;
+        sensor_reset_offset();
+        Mode = AVERAGE_MODE;
+        return;
+    }
+    if (Mode == AVERAGE_MODE) {
+        motor_stop();
+        if (OffsetCounter < AVERAGENUM) {
+            sensor_calc_offset_avarage();
+            OffsetCounter++;
+            return;
+        }
+        S_time = micros();
+    }
+    observation_safety_enforce();
+    telemetry_capture_imu();
+    OldMode = Mode;
+    return;
+
     // if (Interval_time>0.006)USBSerial.printf("%9.6f\n\r", Interval_time);
     // USBSerial.printf("Mode=%d OverG=%d\n\r", Mode, OverG_flag);
     // Begin Mode select
@@ -401,14 +428,45 @@ void loop_400Hz(void) {
         rate_control();
     }
 
-    //// Telemetry
-    // telemetry_fast();
-    telemetry();
-
     uint32_t ce_time = micros();
     Dt_time          = ce_time - cs_time;
     OldMode          = Mode;  // Memory now mode
     // End of Loop_400Hz function
+}
+
+void observation_safety_enforce(void) {
+    Mode = PARKING_MODE;
+    Control_mode = ANGLECONTROL;
+    Throttle_control_mode = 0;
+    Alt_flag = 0;
+    Flip_flag = 0;
+    Thrust_command = 0.0f;
+    Thrust_command2 = 0.0f;
+    Thrust0 = 0.0f;
+    Roll_rate_reference = 0.0f;
+    Pitch_rate_reference = 0.0f;
+    Yaw_rate_reference = 0.0f;
+    Roll_angle_reference = 0.0f;
+    Pitch_angle_reference = 0.0f;
+    Yaw_angle_reference = 0.0f;
+    Roll_rate_command = 0.0f;
+    Pitch_rate_command = 0.0f;
+    Yaw_rate_command = 0.0f;
+    Roll_angle_command = 0.0f;
+    Pitch_angle_command = 0.0f;
+    Yaw_angle_command = 0.0f;
+    FrontRight_motor_duty = 0.0f;
+    FrontLeft_motor_duty = 0.0f;
+    RearRight_motor_duty = 0.0f;
+    RearLeft_motor_duty = 0.0f;
+    p_pid.reset();
+    q_pid.reset();
+    r_pid.reset();
+    phi_pid.reset();
+    theta_pid.reset();
+    alt_pid.reset();
+    z_dot_pid.reset();
+    motor_stop();
 }
 
 void flip(void) {

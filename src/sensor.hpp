@@ -54,6 +54,7 @@ typedef struct {
 // extern volatile float Ax,Ay,Az,Wp,Wq,Wr,Mx,My,Mz,Mx0,My0,Mz0,Mx_ave,My_ave,Mz_ave;
 extern volatile float Roll_angle, Pitch_angle, Yaw_angle;
 extern volatile float Roll_rate, Pitch_rate, Yaw_rate;
+extern volatile float Roll_rate_raw, Pitch_rate_raw, Yaw_rate_raw;
 extern volatile float Accel_x_raw, Accel_y_raw, Accel_z_raw;
 extern volatile float Accel_x, Accel_y, Accel_z;
 extern volatile float Accel_z_d;
@@ -70,6 +71,7 @@ extern float Over_g, Over_rate;
 extern uint8_t OverG_flag;
 extern uint8_t Range0flag;
 extern volatile uint8_t Under_voltage_flag;
+extern volatile uint8_t Imu_read_valid;
 extern volatile uint8_t ToF_bottom_data_ready_flag;
 extern volatile float Az;
 extern volatile float Az_bias;
