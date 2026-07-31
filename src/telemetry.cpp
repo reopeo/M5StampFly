@@ -35,6 +35,11 @@ struct queued_imu_sample_t {
     uint64_t acquisition_time_us;
 };
 
+struct status_barrier_t {
+    uint64_t uptime_us;
+    uint32_t imu_queue_drop_count;
+};
+
 queued_imu_sample_t imu_queue[IMU_QUEUE_CAPACITY];
 portMUX_TYPE imu_queue_mux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t imu_queue_head = 0;
@@ -62,6 +67,9 @@ bool parse_pc_address(void) {
 
 void queue_imu_sample(const queued_imu_sample_t& sample) {
     portENTER_CRITICAL(&imu_queue_mux);
+    queued_imu_sample_t captured = sample;
+    // Capture under the queue lock so it is ordered after any status barrier.
+    captured.acquisition_time_us = static_cast<uint64_t>(esp_timer_get_time());
     if (imu_queue_count == IMU_QUEUE_CAPACITY) {
         imu_queue_head = static_cast<uint8_t>((imu_queue_head + 1) % IMU_QUEUE_CAPACITY);
         imu_queue_count--;
@@ -69,7 +77,7 @@ void queue_imu_sample(const queued_imu_sample_t& sample) {
         imu_queue_overflow = true;
     }
     const uint8_t tail = static_cast<uint8_t>((imu_queue_head + imu_queue_count) % IMU_QUEUE_CAPACITY);
-    imu_queue[tail] = sample;
+    imu_queue[tail] = captured;
     imu_queue_count++;
     portEXIT_CRITICAL(&imu_queue_mux);
 }
@@ -89,11 +97,19 @@ bool take_imu_sample(queued_imu_sample_t* sample, bool* overflow) {
     return available;
 }
 
-uint32_t queue_drop_count_snapshot(void) {
+status_barrier_t capture_status_barrier(void) {
+    status_barrier_t barrier = {};
     portENTER_CRITICAL(&imu_queue_mux);
-    const uint32_t result = imu_queue_drop_count;
+    if (imu_queue_count != 0) {
+        imu_queue_drop_count += imu_queue_count;
+        imu_queue_overflow = true;
+        imu_queue_count = 0;
+        imu_queue_head = 0;
+    }
+    barrier.uptime_us = static_cast<uint64_t>(esp_timer_get_time());
+    barrier.imu_queue_drop_count = imu_queue_drop_count;
     portEXIT_CRITICAL(&imu_queue_mux);
-    return result;
+    return barrier;
 }
 
 void start_wifi_connect(void) {
@@ -131,10 +147,11 @@ bool send_datagram(WiFiUDP& udp, const uint8_t* data, size_t length) {
 }
 
 void send_status(WiFiUDP& udp) {
+    const status_barrier_t barrier = capture_status_barrier();
     protocol_status_t status = {};
-    status.uptime_us = static_cast<uint64_t>(esp_timer_get_time());
+    status.uptime_us = barrier.uptime_us;
     status.last_imu_sequence = last_imu_sequence;
-    status.imu_queue_drop_count = queue_drop_count_snapshot();
+    status.imu_queue_drop_count = barrier.imu_queue_drop_count;
     status.udp_send_failure_count = udp_send_failure_count;
     status.wifi_reconnect_count = wifi_reconnect_count;
     status.wifi_state = wifi_state;
@@ -197,7 +214,6 @@ void telemetry_capture_imu(void) {
     if (wifi_state != 2) return;
 
     queued_imu_sample_t queued = {};
-    queued.acquisition_time_us = static_cast<uint64_t>(esp_timer_get_time());
     queued.sample.accel_x = Accel_x_raw * GRAVITY_MPS2;
     queued.sample.accel_y = -Accel_y_raw * GRAVITY_MPS2;
     queued.sample.accel_z = -Accel_z_raw * GRAVITY_MPS2;

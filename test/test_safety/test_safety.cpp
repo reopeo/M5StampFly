@@ -5,6 +5,7 @@
 #include <unity.h>
 
 #include "flight_control_source.hpp"
+#include "telemetry_source.hpp"
 
 namespace {
 // This is intentionally a source-level guard: the native environment cannot
@@ -79,9 +80,34 @@ void test_observation_safety_enforce_clears_outputs_and_state(void) {
     }
 }
 
+void test_telemetry_timestamps_have_status_barrier_ordering(void) {
+    const std::string source = std::string(TELEMETRY_SOURCE);
+    const std::string queue = function_body(source, "void queue_imu_sample(const queued_imu_sample_t& sample) {");
+    const std::string barrier = function_body(source, "status_barrier_t capture_status_barrier(void) {");
+    const std::string status = function_body(source, "void send_status(WiFiUDP& udp) {");
+    TEST_ASSERT_FALSE_MESSAGE(queue.empty(), "queue_imu_sample body is missing");
+    TEST_ASSERT_FALSE_MESSAGE(barrier.empty(), "capture_status_barrier body is missing");
+    TEST_ASSERT_FALSE_MESSAGE(status.empty(), "send_status body is missing");
+    TEST_ASSERT_TRUE_MESSAGE(queue.find("portENTER_CRITICAL(&imu_queue_mux);") != std::string::npos,
+                             "IMU queue lock is missing");
+    TEST_ASSERT_TRUE_MESSAGE(queue.find("captured.acquisition_time_us = static_cast<uint64_t>(esp_timer_get_time());") !=
+                                 std::string::npos,
+                             "IMU timestamp is not captured under queue lock");
+    TEST_ASSERT_TRUE_MESSAGE(barrier.find("portENTER_CRITICAL(&imu_queue_mux);") != std::string::npos,
+                             "status barrier lock is missing");
+    TEST_ASSERT_TRUE_MESSAGE(barrier.find("barrier.uptime_us = static_cast<uint64_t>(esp_timer_get_time());") !=
+                                 std::string::npos,
+                             "status timestamp is not captured under queue lock");
+    TEST_ASSERT_TRUE_MESSAGE(status.find("capture_status_barrier();") != std::string::npos,
+                             "status barrier is not used before encoding");
+    TEST_ASSERT_TRUE_MESSAGE(status.find("status.uptime_us = barrier.uptime_us;") != std::string::npos,
+                             "status header/payload timestamp source changed");
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_observation_loop_has_unconditional_safety_gate);
     RUN_TEST(test_observation_safety_enforce_clears_outputs_and_state);
+    RUN_TEST(test_telemetry_timestamps_have_status_barrier_ordering);
     return UNITY_END();
 }
