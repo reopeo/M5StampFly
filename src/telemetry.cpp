@@ -166,6 +166,26 @@ void send_status(WiFiUDP& udp) {
     if (!send_datagram(udp, datagram, length)) udp_send_failure_count++;
 }
 
+bool send_one_imu_sample(WiFiUDP& udp) {
+    queued_imu_sample_t queued;
+    bool overflow = false;
+    if (!take_imu_sample(&queued, &overflow)) return false;
+    if (overflow) queued.sample.health_flags |= 0x04;
+    uint8_t datagram[PROTOCOL_IMU_DATAGRAM_SIZE];
+    const uint32_t sequence = next_sequence++;
+    const size_t length = protocol_encode_imu(datagram, sizeof(datagram), source_id, session_id, sequence,
+                                               queued.acquisition_time_us, queued.sample);
+    last_imu_sequence = sequence;
+    if (!send_datagram(udp, datagram, length)) udp_send_failure_count++;
+    return true;
+}
+
+uint8_t drain_imu_samples(WiFiUDP& udp) {
+    uint8_t sent = 0;
+    while (sent < IMU_QUEUE_CAPACITY && send_one_imu_sample(udp)) ++sent;
+    return sent;
+}
+
 void telemetry_sender_task(void*) {
     WiFiUDP udp;
     WiFi.mode(WIFI_STA);
@@ -178,25 +198,21 @@ void telemetry_sender_task(void*) {
         const uint32_t now_ms = millis();
         maintain_wifi(now_ms);
         if (wifi_state == 2) {
+            uint8_t work_count = 0;
             if (wifi_state != previous_wifi_state || static_cast<int32_t>(now_ms - next_status_ms) >= 0) {
+                // Flush older samples before the status barrier so the status
+                // timestamp remains ordered without intentionally dropping the queue.
+                work_count = drain_imu_samples(udp);
                 send_status(udp);
                 next_status_ms = now_ms + 1000;
             }
-
-            queued_imu_sample_t queued;
-            bool overflow = false;
-            if (take_imu_sample(&queued, &overflow)) {
-                if (overflow) queued.sample.health_flags |= 0x04;
-                uint8_t datagram[PROTOCOL_IMU_DATAGRAM_SIZE];
-                const uint32_t sequence = next_sequence++;
-                const size_t length = protocol_encode_imu(datagram, sizeof(datagram), source_id, session_id, sequence,
-                                                          queued.acquisition_time_us, queued.sample);
-                last_imu_sequence = sequence;
-                if (!send_datagram(udp, datagram, length)) udp_send_failure_count++;
-            }
+            work_count = static_cast<uint8_t>(work_count + drain_imu_samples(udp));
+            if (work_count == 0) vTaskDelay(1);
+            else taskYIELD();
+        } else {
+            vTaskDelay(1);
         }
         previous_wifi_state = wifi_state;
-        vTaskDelay(1);
     }
 }
 }  // namespace

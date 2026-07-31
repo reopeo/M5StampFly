@@ -104,10 +104,36 @@ void test_telemetry_timestamps_have_status_barrier_ordering(void) {
                              "status header/payload timestamp source changed");
 }
 
+void test_telemetry_sender_drains_before_status_and_yields_when_busy(void) {
+    const std::string source = std::string(TELEMETRY_SOURCE);
+    const std::string drain = function_body(source, "uint8_t drain_imu_samples(WiFiUDP& udp) {");
+    const std::string sender = function_body(source, "void telemetry_sender_task(void*) {");
+    TEST_ASSERT_FALSE_MESSAGE(drain.empty(), "drain_imu_samples body is missing");
+    TEST_ASSERT_FALSE_MESSAGE(sender.empty(), "telemetry sender body is missing");
+
+    TEST_ASSERT_TRUE_MESSAGE(drain.find("sent < IMU_QUEUE_CAPACITY") != std::string::npos,
+                             "IMU drain is not bounded");
+    const size_t first_drain = sender.find("work_count = drain_imu_samples(udp);");
+    const size_t status = sender.find("send_status(udp);");
+    const size_t second_drain = sender.find("work_count = static_cast<uint8_t>(work_count + drain_imu_samples(udp));");
+    TEST_ASSERT_TRUE_MESSAGE(first_drain != std::string::npos, "status pre-drain is missing");
+    TEST_ASSERT_TRUE_MESSAGE(status != std::string::npos, "status send is missing");
+    TEST_ASSERT_TRUE_MESSAGE(second_drain != std::string::npos, "normal IMU drain is missing");
+    TEST_ASSERT_TRUE_MESSAGE(first_drain < status && status < second_drain,
+                             "sender order is not drain then status then drain");
+    TEST_ASSERT_TRUE_MESSAGE(sender.find("if (work_count == 0) vTaskDelay(1);") != std::string::npos,
+                             "idle delay guard is missing");
+    TEST_ASSERT_TRUE_MESSAGE(sender.find("else taskYIELD();") != std::string::npos,
+                             "busy sender yield is missing");
+    TEST_ASSERT_TRUE_MESSAGE(sender.find("} else {\n            vTaskDelay(1);") != std::string::npos,
+                             "disconnected idle delay is missing");
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_observation_loop_has_unconditional_safety_gate);
     RUN_TEST(test_observation_safety_enforce_clears_outputs_and_state);
     RUN_TEST(test_telemetry_timestamps_have_status_barrier_ordering);
+    RUN_TEST(test_telemetry_sender_drains_before_status_and_yields_when_busy);
     return UNITY_END();
 }
