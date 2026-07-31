@@ -41,5 +41,8 @@ a proposal to the primary coordinator first.
 
 Treat changes to motor output, arming, failsafe, and control timing as
 safety-critical. Firmware build results are not hardware evidence. Flashing and
-motor/flight tests require explicit authorization, and motor bench tests must
-begin with propellers removed.
+motor/flight tests require explicit authorization. Observation and calibration
+bench tests keep motor output at zero. A motor-running test with installed
+propellers is not authorized by a software output cap alone; it requires
+explicit approval plus a restraint, guarding, output limit, e-stop, and abort
+plan.
