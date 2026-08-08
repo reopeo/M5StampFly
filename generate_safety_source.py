@@ -14,4 +14,5 @@ def write_source_header(source_name, header_name, symbol):
 
 write_source_header("flight_control.cpp", "flight_control_source.hpp", "FLIGHT_CONTROL_SOURCE")
 write_source_header("telemetry.cpp", "telemetry_source.hpp", "TELEMETRY_SOURCE")
+write_source_header("sensor.cpp", "sensor_source.hpp", "SENSOR_SOURCE")
 env.Append(CPPPATH=[str(generated_dir)])

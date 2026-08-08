@@ -5,6 +5,7 @@
 #include <unity.h>
 
 #include "flight_control_source.hpp"
+#include "sensor_source.hpp"
 #include "telemetry_source.hpp"
 
 namespace {
@@ -129,11 +130,32 @@ void test_telemetry_sender_drains_before_status_and_yields_when_busy(void) {
                              "disconnected idle delay is missing");
 }
 
+void test_observation_sensor_path_skips_blocking_auxiliary_i2c(void) {
+    const std::string source = std::string(SENSOR_SOURCE);
+    const std::string sensor = function_body(source, "float sensor_read(void)");
+    TEST_ASSERT_FALSE_MESSAGE(sensor.empty(), "sensor_read body is missing");
+
+    const size_t parking_guard = sensor.find("if (Mode == PARKING_MODE)");
+    const size_t tof_call = sensor.find("tof_bottom_get_range()");
+    TEST_ASSERT_TRUE_MESSAGE(parking_guard != std::string::npos, "parking auxiliary-I2C guard is missing");
+    TEST_ASSERT_TRUE_MESSAGE(tof_call != std::string::npos, "ToF acquisition call is missing");
+    TEST_ASSERT_TRUE_MESSAGE(parking_guard < tof_call, "ToF call is not guarded by parking mode");
+    TEST_ASSERT_TRUE_MESSAGE(sensor.find("ToF_bottom_data_ready_flag = 0;") != std::string::npos,
+                             "parking mode does not clear stale ToF readiness");
+
+    const size_t voltage_guard = sensor.find("if (Mode == PARKING_MODE)", tof_call);
+    const size_t voltage_call = sensor.find("ina3221.getVoltage(INA3221_CH2)");
+    TEST_ASSERT_TRUE_MESSAGE(voltage_guard != std::string::npos, "parking voltage guard is missing");
+    TEST_ASSERT_TRUE_MESSAGE(voltage_call != std::string::npos, "voltage acquisition call is missing");
+    TEST_ASSERT_TRUE_MESSAGE(voltage_guard < voltage_call, "voltage call is not guarded by parking mode");
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_observation_loop_has_unconditional_safety_gate);
     RUN_TEST(test_observation_safety_enforce_clears_outputs_and_state);
     RUN_TEST(test_telemetry_timestamps_have_status_barrier_ordering);
     RUN_TEST(test_telemetry_sender_drains_before_status_and_yields_when_busy);
+    RUN_TEST(test_observation_sensor_path_skips_blocking_auxiliary_i2c);
     return UNITY_END();
 }

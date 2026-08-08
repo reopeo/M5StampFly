@@ -267,7 +267,13 @@ float sensor_read(void) {
         // Get Altitude (30Hz)
         Az = az_filter.update(-Accel_z_d, sens_interval);
 
-        if (dcnt > interval) {
+        // Observation mode never consumes altitude data.  Avoid the blocking
+        // ToF I2C transaction in PARKING_MODE so it cannot overrun the 2.5 ms
+        // IMU loop period and collapse timer ticks.
+        if (Mode == PARKING_MODE) {
+            dcnt = 0u;
+            ToF_bottom_data_ready_flag = 0;
+        } else if (dcnt > interval) {
             if (ToF_bottom_data_ready_flag) {
                 dcnt                       = 0u;
                 old_alt_time               = alt_time;
@@ -335,8 +341,14 @@ float sensor_read(void) {
     }
 
     // Battery voltage check
-    Voltage   = ina3221.getVoltage(INA3221_CH2);
-    filterd_v = voltage_filter.update(Voltage, Control_period);
+    if (Mode == PARKING_MODE) {
+        // Battery voltage is not consumed by the observation path; avoid a
+        // second blocking I2C transaction in the high-rate telemetry loop.
+        filterd_v = Voltage;
+    } else {
+        Voltage   = ina3221.getVoltage(INA3221_CH2);
+        filterd_v = voltage_filter.update(Voltage, Control_period);
+    }
 
     if (Under_voltage_flag != UNDER_VOLTAGE_COUNT) {
         if (filterd_v < POWER_LIMIT)
