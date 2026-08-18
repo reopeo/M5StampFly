@@ -36,8 +36,8 @@ from this repository.
 Read the parent `../specs/` documents before changing an external interface.
 Packet layouts, units, coordinate frames, timing, arming, failsafe behavior,
 control rates, and PC-to-flight authority are cross-component contracts. Do not
-implement an unresolved `TBD` or make a breaking contract change locally; return
-a proposal to the primary coordinator first.
+implement an unresolved `TBD` or make a breaking contract change locally;
+return a proposal to the repository owner first.
 
 Treat changes to motor output, arming, failsafe, and control timing as
 safety-critical. Firmware build results are not hardware evidence. Flashing and
